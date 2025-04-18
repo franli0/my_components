@@ -13,8 +13,8 @@ PreApproach::PreApproach(const rclcpp::NodeOptions & options)
   start_yaw_(0.0),
   target_yaw_(0.0)
 {
-    // Hardcoded values (previously parameters)
-    obstacle_distance_ = 0.5;  // 0.5 meters
+    // Hardcoded values
+    obstacle_distance_ = 0.3;  // 0.3 meters
     rotation_degrees_ = -90.0;  // -90 degrees
     
     // Convert degrees to radians
