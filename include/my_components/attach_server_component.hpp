@@ -65,10 +65,10 @@ private:
     double cart_position_offset_x_;
     double cart_position_offset_y_;
     double under_shelf_distance_;  // Distance to move under the shelf
-    
+
     // Service request/response
     std::shared_ptr<attach_shelf::srv::GoToLoading::Request> current_request_;
-    std::shared_ptr<attach_shelf::srv::GoToLoading::Response> current_response_;
+    std::shared_ptr<attach_shelf::srv::GoToLoading::Response> pending_response_;
     
     // Position data
     double robot_x_;    // Robot x position in odom frame
@@ -82,8 +82,8 @@ private:
     double left_leg_y_;  // Left leg y position in robot frame  
     double right_leg_x_; // Right leg x position in robot frame
     double right_leg_y_; // Right leg y position in robot frame
-    double under_shelf_x_; // Under-shelf position x in odom frame
-    double under_shelf_y_; // Under-shelf position y in odom frame
+    double under_shelf_target_x_; // Under-shelf position x in odom frame
+    double under_shelf_target_y_; // Under-shelf position y in odom frame
 
     double movement_timer_ = 0.0;
     bool moving_forward_phase_ = false;
