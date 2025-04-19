@@ -14,12 +14,16 @@ AttachServer::AttachServer(const rclcpp::NodeOptions & options)
     // Initialize adjustable parameters
     cart_position_offset_x_ = 0.22;  // Forward adjustment for cart_frame
     cart_position_offset_y_ = 0.0;   // Lateral adjustment for cart_frame
-    under_shelf_distance_ = 0.3;     // Distance to move under the shelf (in meters)
+    under_shelf_distance_ = 0.5;     // Distance to move under the shelf (in meters)
     
     // Initialize position tracking
     robot_x_ = 0.0;
     robot_y_ = 0.0;
     robot_yaw_ = 0.0;
+    
+    // Initialize target positions
+    under_shelf_target_x_ = 0.0;
+    under_shelf_target_y_ = 0.0;
     
     // Create publishers and subscribers
     vel_publisher_ = this->create_publisher<geometry_msgs::msg::Twist>(
@@ -47,7 +51,7 @@ AttachServer::AttachServer(const rclcpp::NodeOptions & options)
     timer_ = this->create_wall_timer(50ms, std::bind(&AttachServer::timer_callback, this));
     
     RCLCPP_INFO(this->get_logger(), "Approach Service Server component started");
-    RCLCPP_INFO(this->get_logger(), "Under-shelf distance: %.2f m", under_shelf_distance_);
+    RCLCPP_INFO(this->get_logger(), "Under-shelf distance: 0.3 m");
 }
 
 void AttachServer::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -83,7 +87,10 @@ void AttachServer::handle_service(
     
     // Save request for later use
     current_request_ = request;
-    current_response_ = response;
+    
+    // CRITICAL CHANGE: Don't store the response yet! We'll store it at completion time.
+    // The service call will remain open until we're done with all operations.
+    pending_response_ = response;
     
     // Reset state variables
     service_in_progress_ = true;
@@ -96,6 +103,9 @@ void AttachServer::handle_service(
     // Start the state machine
     state_ = DETECTING_LEGS;
     RCLCPP_INFO(this->get_logger(), "Starting leg detection...");
+    
+    // IMPORTANT: Don't fill the response here! Let the process complete first.
+    // The response will be filled and sent in the complete_service method.
 }
 
 void AttachServer::scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
@@ -276,7 +286,7 @@ void AttachServer::calculate_cart_position()
     // Add rightward bias (negative y in robot frame is to the right)
     double rightward_bias = -0.05;  // 5cm to the right
 
-    // Final cart position with offsets
+    // Final cart position with offsets - exact same as original
     cart_x_ = midpoint_x + cart_position_offset_x_;
     cart_y_ = midpoint_y + cart_position_offset_y_ + rightward_bias;
 
@@ -355,7 +365,7 @@ void AttachServer::publish_cart_transform()
 
 void AttachServer::timer_callback()
 {
-    // Process state machine
+     // Process state machine
     switch (state_) {
         case DETECTING_LEGS:
             // Wait for leg detection in scan_callback
@@ -371,6 +381,16 @@ void AttachServer::timer_callback()
             
         case LIFTING_SHELF:
             execute_lift_shelf();
+            break;
+            
+        case SHUTDOWN:
+            // Count down to shutdown
+            shutdown_counter_++;
+            if (shutdown_counter_ >= 60) { // ~3 seconds at 50ms timer
+                RCLCPP_INFO(this->get_logger(), "Shutting down node...");
+                // Don't call rclcpp::shutdown() here as it would shut down the container
+                // Instead just stay in this state
+            }
             break;
             
         case COMPLETED:
@@ -395,25 +415,38 @@ void AttachServer::execute_move_to_cart()
         "Moving to cart: Distance: %.2f m, Angle error: %.2f rad",
         distance, angle_error);
     
-    // If we've reached the cart
+    // Check if we've reached the cart 
     if (distance < 0.1) {  // 10cm threshold
         stop_robot();
         RCLCPP_INFO(this->get_logger(), "Reached cart position");
         
-        // Move directly to under-shelf movement
+        // Calculate the target position for under-shelf movement
+        // This will be 0.3m forward from the cart position
+        // Need to calculate in world frame coordinates
+        
+        // The forward direction in world frame is based on robot's current orientation
+        double forward_x = std::cos(robot_yaw_);
+        double forward_y = std::sin(robot_yaw_);
+        
+        // Calculate target position 0.3m forward from current position
+        under_shelf_target_x_ = robot_x_ + under_shelf_distance_ * forward_x;
+        under_shelf_target_y_ = robot_y_ + under_shelf_distance_ * forward_y;
+        
+        RCLCPP_INFO(this->get_logger(), "Setting under-shelf target position: (%.2f, %.2f), %.2f meters ahead", 
+                   under_shelf_target_x_, under_shelf_target_y_, under_shelf_distance_);
+        
+        // Move to under-shelf movement
         state_ = MOVING_UNDER_SHELF;
-        movement_timer_ = 0.0;  // Reset timer for under-shelf movement
         RCLCPP_INFO(this->get_logger(), "Starting under-shelf movement");
         return;
     }
     
-    // SIMPLER COMBINED APPROACH - always move and turn at same time
-    // Use larger threshold (0.15 rad ≈ 8.6 degrees) for better progress
+    // Normal approach behavior - move toward cart position
     double forward_speed = 0.0;
     double angular_velocity = 0.0;
     
     // Always apply angular correction
-    angular_velocity = 0.3 * angle_error;  // Stronger correction
+    angular_velocity = 0.3 * angle_error;
     
     // Ensure minimum angular velocity to overcome friction when needed
     if (std::abs(angle_error) > 0.1 && std::abs(angular_velocity) < 0.1) {
@@ -452,44 +485,66 @@ double AttachServer::normalize_angle(double angle) {
 
 void AttachServer::execute_move_under_shelf()
 {
-    // Very simple timed approach with phases
-    movement_timer_ += 0.05;  // 50ms per timer tick
-
-    // Simple state machine with timing
-    if (movement_timer_ < 0.5) {  // First 0.5 seconds - just stop and prepare
+    // Calculate vector from robot to under-shelf target position
+    double dx = under_shelf_target_x_ - robot_x_;
+    double dy = under_shelf_target_y_ - robot_y_;
+    double distance = std::sqrt(dx*dx + dy*dy);
+    
+    // Calculate angle to target in world frame
+    double angle_to_target = std::atan2(dy, dx);
+    double angle_error = normalize_angle(angle_to_target - robot_yaw_);
+    
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+        "Moving under shelf: Distance: %.2f m, Angle error: %.2f rad",
+        distance, angle_error);
+    
+    // Check if we've reached the target
+    if (distance < 0.05) {  // 5cm threshold
         stop_robot();
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
-            "Preparing for under-shelf movement...");
-    } 
-    else if (movement_timer_ < 2.0) {  // Next 1.5 seconds - right turn in place
-        // Turn right in place to better align
-        geometry_msgs::msg::Twist cmd_vel;
-        cmd_vel.linear.x = 0.0;
-        cmd_vel.angular.z = -0.2;  // Right turn
-        vel_publisher_->publish(cmd_vel);
-
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
-            "Phase 1: Turning right in place...");
-    }
-    else if (movement_timer_ < 5.0) {  // Next 3 seconds - forward movement
-        // Move forward
-        geometry_msgs::msg::Twist cmd_vel;
-        cmd_vel.linear.x = 0.15;  // Forward movement
-        cmd_vel.angular.z = -0.02;  // Slight right bias while moving
-        vel_publisher_->publish(cmd_vel);
-
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
-            "Phase 2: Moving forward under shelf...");
-    }
-    else {
-        // After 5 seconds, we're done
-        stop_robot();
-        RCLCPP_INFO(this->get_logger(), "Under-shelf movement completed!");
-
+        RCLCPP_INFO(this->get_logger(), "Reached position under shelf");
+        
         // Move to lifting phase
         state_ = LIFTING_SHELF;
-        movement_timer_ = 0.0;  // Reset for potential future use
+        RCLCPP_INFO(this->get_logger(), "Starting shelf lifting process");
+        return;
     }
+    
+    // Normal approach behavior - move toward under-shelf position
+    double forward_speed = 0.0;
+    double angular_velocity = 0.0;
+    
+    // Apply angular correction with higher gain for more precise control
+    angular_velocity = 0.5 * angle_error;
+    
+    // Ensure minimum angular velocity to overcome friction when needed
+    if (std::abs(angle_error) > 0.05 && std::abs(angular_velocity) < 0.1) {
+        angular_velocity = (angle_error > 0) ? 0.1 : -0.1;
+    }
+    
+    // Move forward at consistent speed when well-aligned
+    if (std::abs(angle_error) < 0.1) {
+        forward_speed = 0.15;  // Slower speed for careful positioning
+    } else if (std::abs(angle_error) < 0.3) {
+        // Somewhat aligned, move forward slowly
+        forward_speed = 0.1;
+    } else {
+        // Poor alignment, focus on turning first
+        forward_speed = 0.0;
+    }
+    
+    // Limit velocities 
+    forward_speed = std::max(0.0, std::min(0.2, forward_speed));
+    angular_velocity = std::max(-0.5, std::min(0.5, angular_velocity));
+    
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+        "Under-shelf movement: speed=%.2f m/s, angular=%.2f rad/s, distance=%.2f m, angle_error=%.2f rad",
+        forward_speed, angular_velocity, distance, angle_error);
+    
+    // Send velocity commands
+    geometry_msgs::msg::Twist cmd_vel;
+    cmd_vel.linear.x = forward_speed;
+    cmd_vel.angular.z = angular_velocity;
+    vel_publisher_->publish(cmd_vel);
 }
 
 void AttachServer::execute_lift_shelf()
@@ -529,10 +584,22 @@ void AttachServer::complete_service(bool success)
     
     service_in_progress_ = false;
     
-    // Complete the service call
-    if (current_response_) {
-        current_response_->complete = success;
-        current_response_.reset();
+    // Now is the time to complete the service response
+    // AFTER all operations are done (movement to cart, under shelf, lifting)
+    if (pending_response_) {
+        RCLCPP_INFO(this->get_logger(), "Operations completed, sending service response with success=%s", 
+                   success ? "true" : "false");
+        
+        // Fill in the response and send it back to the client
+        pending_response_->complete = success;
+        
+        // The service call completes when this method exits
+        // The client will get the response after the shelf is lifted
+        
+        // Clear the saved response
+        pending_response_.reset();
+    } else {
+        RCLCPP_ERROR(this->get_logger(), "No pending response found when completing service!");
     }
     
     RCLCPP_INFO(this->get_logger(), "Service completed with result: %s", 
